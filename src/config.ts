@@ -2,8 +2,17 @@ import fs from 'fs-extra';
 import path from 'path';
 import { z } from 'zod';
 
-// Determine the absolute base directory (project root)
-const BASE_DIR = path.resolve(import.meta.dir, '..');
+// Determine if we are running as a compiled binary or via bun runtime
+const isBinary = !process.execPath.endsWith('bun') && !process.execPath.endsWith('bun.exe');
+
+// Calculate absolute base directory
+// If binary: use the folder where the .exe file is located
+// If source: use the project root (one level up from src/)
+const BASE_DIR = isBinary 
+  ? path.dirname(process.execPath) 
+  : path.resolve(import.meta.dir, '..');
+
+console.error(`[Config] Base Directory resolved to: ${BASE_DIR}`);
 
 export const RepoSchema = z.object({
   url: z.string().regex(/^(https?:\/\/)?([\da-z\.-]+)\.([a-z\.]{2,6})([\/\w \.-]*)*\/?$/, "Invalid URL format"),
@@ -34,7 +43,7 @@ export async function getConfig(): Promise<Config> {
     const data = await fs.readJSON(CONFIG_FILE);
     const parsed = ConfigSchema.parse(data);
 
-    // Ensure storagePath is absolute even if user manually edited it to be relative
+    // Ensure storagePath is absolute
     if (!path.isAbsolute(parsed.storagePath)) {
       parsed.storagePath = path.resolve(BASE_DIR, parsed.storagePath);
     }
