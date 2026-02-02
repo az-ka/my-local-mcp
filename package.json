@@ -1,7 +1,12 @@
 {
   "name": "my-local-mcp",
-  "module": "index.ts",
+  "module": "src/index.ts",
   "type": "module",
+  "scripts": {
+    "build": "bun build ./src/index.ts --compile --outfile server",
+    "start": "bun run src/index.ts",
+    "typecheck": "bun tsc --noEmit"
+  },
   "private": true,
   "devDependencies": {
     "@types/bun": "latest",
