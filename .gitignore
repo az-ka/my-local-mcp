@@ -36,6 +36,9 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 # Build artifacts
 server
 server.exe
+server.old.exe
+*.bun-build
+nul
 storage/
 settings.json
 

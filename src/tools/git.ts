@@ -11,7 +11,8 @@ export async function addRepo(url: string, name?: string) {
   
   // Basic security: avoid directory traversal
   const safeName = (name || url.split('/').pop()?.replace('.git', '') || 'unknown')
-    .replace(/[\\/..]/g, '_');
+    .replace(/[\\/.]/g, '_')
+    .replace(/_{2,}/g, '_');
     
   const targetPath = path.resolve(process.cwd(), config.storagePath, safeName);
 
