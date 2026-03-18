@@ -3,17 +3,73 @@ import path from 'path';
 import fs from 'fs-extra';
 import { getConfig, saveConfig } from '../config';
 
+export type NormalizedRepoInput = {
+  cloneUrl: string;
+  storedUrl: string;
+  branch?: string;
+  inferredName: string;
+};
+
+export function normalizeRepoInput(rawUrl: string, rawBranch?: string): NormalizedRepoInput {
+  const trimmedUrl = rawUrl.trim();
+  const normalizedUrl = /^https?:\/\//i.test(trimmedUrl) ? trimmedUrl : `https://${trimmedUrl}`;
+  const parsedUrl = new URL(normalizedUrl);
+
+  if (!['http:', 'https:'].includes(parsedUrl.protocol)) {
+    throw new Error('Only HTTP(S) repository URLs are supported.');
+  }
+  const pathSegments = parsedUrl.pathname.split('/').filter(Boolean);
+
+  if (pathSegments.length < 2) {
+    throw new Error('Repository URL must include both owner and repository name.');
+  }
+
+  const owner = pathSegments[0]!;
+  const repoSegment = pathSegments[1]!;
+  const rest = pathSegments.slice(2);
+  const repoName = repoSegment.replace(/\.git$/i, '');
+  let branch = rawBranch?.trim();
+
+  if (rest[0] === 'tree') {
+    const treeBranch = rest.slice(1).join('/').trim();
+    if (!treeBranch) {
+      throw new Error('GitHub tree URL must include a branch name after "tree/".');
+    }
+    branch = branch || treeBranch;
+  } else if (rest.length > 0) {
+    throw new Error('Only repository root URLs or GitHub tree/<branch> URLs are supported.');
+  }
+
+  parsedUrl.pathname = `/${owner}/${repoName}`;
+  parsedUrl.search = '';
+  parsedUrl.hash = '';
+
+  return {
+    cloneUrl: parsedUrl.toString(),
+    storedUrl: parsedUrl.toString(),
+    branch: branch || undefined,
+    inferredName: repoName,
+  };
+}
+
+async function getCurrentBranch(repoPath: string): Promise<string | undefined> {
+  const git = simpleGit(repoPath);
+  const branch = (await git.revparse(['--abbrev-ref', 'HEAD'])).trim();
+  return branch && branch !== 'HEAD' ? branch : undefined;
+}
+
 /**
  * Clones a repository to local storage and updates config.
  */
-export async function addRepo(url: string, name?: string) {
+export async function addRepo(url: string, name?: string, branch?: string) {
   const config = await getConfig();
+  const normalized = normalizeRepoInput(url, branch);
   
   // Basic security: avoid directory traversal
-  const safeName = (name || url.split('/').pop()?.replace('.git', '') || 'unknown')
+  const safeName = (name || normalized.inferredName || 'unknown')
     .replace(/[\\/.]/g, '_')
     .replace(/_{2,}/g, '_');
-    
+     
   const targetPath = path.resolve(process.cwd(), config.storagePath, safeName);
 
   if (await fs.pathExists(targetPath)) {
@@ -24,17 +80,27 @@ export async function addRepo(url: string, name?: string) {
   
   const git = simpleGit();
   try {
-    console.error(`Cloning ${url} into ${targetPath}...`);
-    await git.clone(url, targetPath);
+    console.error(`Cloning ${normalized.cloneUrl} into ${targetPath}...`);
+
+    const cloneOptions = normalized.branch
+      ? ['--branch', normalized.branch, '--single-branch']
+      : undefined;
+
+    await git.clone(normalized.cloneUrl, targetPath, cloneOptions);
+    const activeBranch = await getCurrentBranch(targetPath);
 
     config.repos[safeName] = {
-      url,
-      branch: 'main',
+      url: normalized.storedUrl,
+      branch: activeBranch || normalized.branch,
       lastSync: new Date().toISOString(),
     };
 
     await saveConfig(config);
-    return `Repository "${safeName}" cloned successfully.`;
+    const branchSuffix = config.repos[safeName].branch
+      ? ` on branch "${config.repos[safeName].branch}"`
+      : '';
+
+    return `Repository "${safeName}" cloned successfully${branchSuffix}.`;
   } catch (error: any) {
     // Cleanup if directory was created but clone failed
     if (await fs.pathExists(targetPath)) {
@@ -73,9 +139,18 @@ export async function syncRepo(name?: string) {
 
     try {
       const git = simpleGit(targetPath);
-      await git.pull();
+      const activeBranch = await getCurrentBranch(targetPath);
+
+      if (activeBranch) {
+        repo.branch = activeBranch;
+        await git.pull('origin', activeBranch);
+      } else {
+        await git.pull();
+      }
+
       repo.lastSync = new Date().toISOString();
-      results.push(`Successfully synced "${repoName}"`);
+      const branchSuffix = repo.branch ? ` on branch "${repo.branch}"` : '';
+      results.push(`Successfully synced "${repoName}"${branchSuffix}`);
     } catch (error: any) {
       results.push(`Failed to sync "${repoName}": ${error.message}`);
     }
@@ -97,7 +172,8 @@ export async function listRepos() {
   }
 
   const output = repoList.map(([name, info]) => {
-    return `- ${name}: ${info.url} (Last Sync: ${info.lastSync || 'Never'})`;
+    const branchLabel = info.branch || 'unknown';
+    return `- ${name}: ${info.url} [branch: ${branchLabel}] (Last Sync: ${info.lastSync || 'Never'})`;
   }).join('\n');
 
   return `Managed Repositories:\n${output}`;

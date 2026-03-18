@@ -16,7 +16,7 @@ console.error(`[Config] Base Directory resolved to: ${BASE_DIR}`);
 
 export const RepoSchema = z.object({
   url: z.string().regex(/^(https?:\/\/)?([\da-z\.-]+)\.([a-z\.]{2,6})([\/\w \.-]*)*\/?$/, "Invalid URL format"),
-  branch: z.string().optional().default('main'),
+  branch: z.string().optional(),
   lastSync: z.string().optional(),
 });
 

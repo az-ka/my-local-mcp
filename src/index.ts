@@ -19,11 +19,12 @@ server.registerTool(
     inputSchema: {
       url: z.string().describe('The public GitHub URL of the repository'),
       name: z.string().optional().describe('Custom name/alias for the local folder'),
+      branch: z.string().optional().describe('Optional branch to clone. GitHub tree/<branch> URLs are also supported.'),
     },
   },
-  async ({ url, name }) => {
+  async ({ url, name, branch }) => {
     try {
-      const result = await addRepo(url, name);
+      const result = await addRepo(url, name, branch);
       return { content: [{ type: 'text', text: result }] };
     } catch (error: any) {
       return { content: [{ type: 'text', text: `Error: ${error.message}` }], isError: true };

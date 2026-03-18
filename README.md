@@ -5,7 +5,7 @@ A local Model Context Protocol (MCP) server that acts as a bridge between your A
 ## Features
 
 - **Git Manager**:
-  - `add_repo`: Clone public GitHub repositories locally.
+  - `add_repo`: Clone public GitHub repositories locally, including specific branches.
   - `sync_repo`: Pull latest changes for tracked repositories.
   - `list_repos`: View all managed repositories.
 - **File Reader**:
@@ -78,6 +78,10 @@ Once connected, you can ask your AI:
 
 > "Check if I have the 'svelte' repo locally. If not, add 'https://github.com/sveltejs/svelte'."
 
+> "Add `https://github.com/filamentphp/filament` using branch `5.x` and save it as `filament-v5`."
+
+> "Add `https://github.com/filamentphp/filament/tree/5.x` as `filament-v5`."
+
 > "Sync all my local repositories."
 
 > "Search for 'onMount' in the svelte repository and explain how it is used based on the code found."
@@ -89,6 +93,30 @@ Once connected, you can ask your AI:
 - `src/index.ts`: MCP Server entry point.
 - `settings.json`: Stores the list of tracked repositories (auto-generated).
 - `storage/`: Directory where repositories are cloned (ignored by git).
+
+## Branch-specific repositories
+
+`add_repo` now supports two ways to select a non-default branch:
+
+- Pass the normal repository URL plus a `branch` value.
+- Pass a GitHub URL in the form `https://github.com/<owner>/<repo>/tree/<branch>`.
+
+Examples:
+
+```json
+{
+  "url": "https://github.com/filamentphp/filament",
+  "name": "filament-v5",
+  "branch": "5.x"
+}
+```
+
+```json
+{
+  "url": "https://github.com/filamentphp/filament/tree/5.x",
+  "name": "filament-v5"
+}
+```
 
 ## References & Credits
 
