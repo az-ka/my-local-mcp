@@ -3,46 +3,78 @@ import path from 'path';
 import glob from 'fast-glob';
 import { getConfig } from '../config';
 
-const MAX_FILE_SIZE = 50 * 1024; // 50KB
-const BATCH_MAX_PER_FILE = 10 * 1024; // 10KB per file in batch mode
+const MAX_FILE_SIZE = 200 * 1024; // 200KB default
+const BATCH_MAX_PER_FILE = 10 * 1024;
 const DEFAULT_MAX_RESULTS = 50;
+const BINARY_SNIFF_BYTES = 4096;
 
-// Common ignore patterns
-const IGNORE_PATTERNS = [
-  '**/node_modules/**',
-  '**/.git/**',
-  '**/package-lock.json',
-  '**/*.lock',
-  '**/dist/**',
-  '**/build/**',
-  '**/.next/**',
-  '**/.nuxt/**',
-  '**/.svelte-kit/**',
-  '**/vendor/**',
-  '**/__pycache__/**',
-  '**/.tox/**',
-  '**/target/**',
+// Single source of truth for ignore patterns.
+const IGNORE_DIRS = [
+  '.git',
+  'node_modules',
+  '__pycache__',
+  '.next',
+  '.nuxt',
+  '.svelte-kit',
+  '.turbo',
+  '.cache',
+  'vendor',
+  'target',
+  'dist',
+  'build',
+  'out',
+  'coverage',
+  '.pytest_cache',
+  '.tox',
 ];
 
-// Documentation file extensions
-const DOC_EXTENSIONS = ['.md', '.mdx', '.rst', '.txt', '.adoc', '.org'];
-const DOC_FILENAMES = ['readme', 'changelog', 'contributing', 'license', 'authors', 'history', 'guide', 'tutorial', 'faq', 'api'];
+const IGNORE_FILES = [
+  '**/package-lock.json',
+  '**/yarn.lock',
+  '**/pnpm-lock.yaml',
+  '**/bun.lock',
+  '**/bun.lockb',
+  '**/Cargo.lock',
+  '**/poetry.lock',
+  '**/composer.lock',
+  '**/*.min.js',
+  '**/*.min.css',
+];
 
-/**
- * Securely resolves a file path within a repository.
- * Throws an error if the path attempts to traverse outside the repo.
- */
+const IGNORE_PATTERNS = [
+  ...IGNORE_DIRS.map((d) => `**/${d}/**`),
+  ...IGNORE_FILES,
+];
+
+// Extensions known to be binary — skip when grepping.
+const BINARY_EXTENSIONS = new Set([
+  '.png', '.jpg', '.jpeg', '.gif', '.bmp', '.ico', '.webp', '.tiff', '.svg',
+  '.pdf', '.zip', '.tar', '.gz', '.tgz', '.7z', '.rar', '.bz2', '.xz',
+  '.exe', '.dll', '.so', '.dylib', '.bin', '.dat', '.dmg', '.iso',
+  '.mp3', '.mp4', '.wav', '.flac', '.ogg', '.webm', '.mov', '.avi', '.mkv',
+  '.woff', '.woff2', '.ttf', '.otf', '.eot',
+  '.class', '.jar', '.war', '.pyc', '.pyo',
+  '.lock', '.lockb',
+  '.db', '.sqlite', '.sqlite3',
+]);
+
+const DOC_EXTENSIONS = ['.md', '.mdx', '.rst', '.txt', '.adoc', '.org'];
+const DOC_FILENAMES = [
+  'readme', 'changelog', 'contributing', 'license',
+  'authors', 'history', 'guide', 'tutorial', 'faq', 'api',
+];
+
 async function resolveRepoPath(repoName: string, subPath: string = ''): Promise<string> {
   const config = await getConfig();
-
   const storageRoot = path.resolve(process.cwd(), config.storagePath);
   const repoRoot = path.join(storageRoot, repoName);
   const targetPath = path.resolve(repoRoot, subPath);
 
-  if (!targetPath.startsWith(repoRoot)) {
+  // Make sure resolved path is inside repoRoot (with separator boundary).
+  const rel = path.relative(repoRoot, targetPath);
+  if (rel.startsWith('..') || path.isAbsolute(rel)) {
     throw new Error(`Security Error: Access denied to path outside repository: ${subPath}`);
   }
-
   return targetPath;
 }
 
@@ -52,22 +84,39 @@ function formatSize(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)}MB`;
 }
 
-/**
- * Build glob include pattern from extensions.
- * e.g. [".md", ".mdx"] → "**\/*.{md,mdx}"
- */
 function extensionsToGlob(extensions: string[]): string {
-  const exts = extensions.map(e => e.replace(/^\./, ''));
+  const exts = extensions.map((e) => e.replace(/^\./, ''));
   if (exts.length === 1) return `**/*.${exts[0]}`;
   return `**/*.{${exts.join(',')}}`;
 }
 
-// ─── Enhanced Tools ──────────────────────────────────────────
+function isBinaryExtension(filePath: string): boolean {
+  return BINARY_EXTENSIONS.has(path.extname(filePath).toLowerCase());
+}
 
 /**
- * Lists files in a repository or subdirectory.
- * Supports extension filtering, size info, and depth control.
+ * Read first chunk and return true if it looks binary (has null bytes).
  */
+async function looksBinary(fullPath: string): Promise<boolean> {
+  const fd = await fs.open(fullPath, 'r');
+  try {
+    const buf = Buffer.alloc(BINARY_SNIFF_BYTES);
+    const { bytesRead } = await fs.read(fd, buf, 0, BINARY_SNIFF_BYTES, 0);
+    for (let i = 0; i < bytesRead; i++) {
+      if (buf[i] === 0) return true;
+    }
+    return false;
+  } finally {
+    await fs.close(fd);
+  }
+}
+
+function escapeRegex(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+// ─── listFiles ───────────────────────────────────────────────
+
 export async function listFiles(
   repoName: string,
   subPath: string = '',
@@ -85,9 +134,7 @@ export async function listFiles(
 
   const stat = await fs.stat(targetPath);
   if (stat.isFile()) {
-    if (options.includeSize) {
-      return [`${subPath} (${formatSize(stat.size)})`];
-    }
+    if (options.includeSize) return [`${subPath} (${formatSize(stat.size)})`];
     return [subPath];
   }
 
@@ -104,10 +151,9 @@ export async function listFiles(
   });
 
   if (!options.includeSize) {
-    return entries.map(e => path.join(subPath, e).replace(/\\/g, '/'));
+    return entries.map((e) => path.join(subPath, e).replace(/\\/g, '/'));
   }
 
-  // With size info — batch stat calls
   const results: string[] = [];
   for (const entry of entries) {
     try {
@@ -122,16 +168,15 @@ export async function listFiles(
   return results;
 }
 
-/**
- * Reads the content of a specific file.
- * Supports line range (start_line, end_line) for partial reads.
- */
+// ─── readFile ────────────────────────────────────────────────
+
 export async function readFile(
   repoName: string,
   filePath: string,
   options: {
     startLine?: number;
     endLine?: number;
+    maxSize?: number;
   } = {},
 ) {
   const targetPath = await resolveRepoPath(repoName, filePath);
@@ -139,41 +184,52 @@ export async function readFile(
   if (!(await fs.pathExists(targetPath))) {
     throw new Error(`File not found: ${filePath}`);
   }
-
   const stat = await fs.stat(targetPath);
-  if (!stat.isFile()) {
-    throw new Error(`Path is not a file: ${filePath}`);
-  }
+  if (!stat.isFile()) throw new Error(`Path is not a file: ${filePath}`);
 
   const hasRange = options.startLine != null || options.endLine != null;
+  const maxSize = options.maxSize ?? MAX_FILE_SIZE;
 
-  // Full file read with size limit (no line range)
   if (!hasRange) {
-    if (stat.size > MAX_FILE_SIZE) {
-      const buffer = Buffer.alloc(MAX_FILE_SIZE);
+    if (stat.size > maxSize) {
+      const buffer = Buffer.alloc(maxSize);
       const fd = await fs.open(targetPath, 'r');
-      await fs.read(fd, buffer, 0, MAX_FILE_SIZE, 0);
-      await fs.close(fd);
-      return `[WARNING: File too large (${formatSize(stat.size)}). Truncated to first 50KB]\n\n${buffer.toString('utf-8')}`;
+      try {
+        await fs.read(fd, buffer, 0, maxSize, 0);
+      } finally {
+        await fs.close(fd);
+      }
+      return `[WARNING: File too large (${formatSize(stat.size)}). Truncated to ${formatSize(maxSize)}. Use start_line/end_line for ranged reads.]\n\n${buffer.toString('utf-8')}`;
     }
     return fs.readFile(targetPath, 'utf-8');
   }
 
-  // Line range read
   const content = await fs.readFile(targetPath, 'utf-8');
   const lines = content.split('\n');
-  const start = Math.max(1, options.startLine ?? 1);
-  const end = Math.min(lines.length, options.endLine ?? lines.length);
+  const total = lines.length;
+
+  // Negative start_line counts from end (e.g. -50 = last 50 lines)
+  let start: number;
+  let end: number;
+  if (options.startLine != null && options.startLine < 0) {
+    start = Math.max(1, total + options.startLine + 1);
+    end = options.endLine != null ? Math.min(total, options.endLine) : total;
+  } else {
+    start = Math.max(1, options.startLine ?? 1);
+    end = Math.min(total, options.endLine ?? total);
+  }
+
+  if (start > end) {
+    return `[Lines ${start}-${end} of ${total} total]\n\n(empty range)`;
+  }
 
   const selectedLines = lines.slice(start - 1, end);
-  const header = `[Lines ${start}-${end} of ${lines.length} total]\n\n`;
+  const header = `[Lines ${start}-${end} of ${total} total]\n\n`;
   return header + selectedLines.map((line, i) => `${start + i}: ${line}`).join('\n');
 }
 
-/**
- * Enhanced text search across the repository.
- * Supports extension filter, context lines, max results, and path scoping.
- */
+// ─── searchCode ──────────────────────────────────────────────
+
 export async function searchCode(
   repoName: string,
   query: string,
@@ -182,6 +238,9 @@ export async function searchCode(
     contextLines?: number;
     maxResults?: number;
     path?: string;
+    caseSensitive?: boolean;
+    regex?: boolean;
+    wholeWord?: boolean;
   } = {},
 ) {
   const basePath = options.path || '';
@@ -191,65 +250,88 @@ export async function searchCode(
     throw new Error(`Path not found: ${basePath || repoName}`);
   }
 
-  const files = await listFiles(repoName, basePath, {
-    extensions: options.extensions,
-  });
+  const files = await listFiles(repoName, basePath, { extensions: options.extensions });
 
-  const results: string[] = [];
-  const lowerQuery = query.toLowerCase();
+  // Build matcher
+  const flags = options.caseSensitive ? '' : 'i';
+  let pattern: RegExp;
+  try {
+    let src = options.regex ? query : escapeRegex(query);
+    if (options.wholeWord) src = `\\b(?:${src})\\b`;
+    pattern = new RegExp(src, flags);
+  } catch (err: any) {
+    throw new Error(`Invalid regex pattern: ${err.message}`);
+  }
+
   const contextLines = options.contextLines ?? 0;
   const maxResults = options.maxResults ?? DEFAULT_MAX_RESULTS;
+  const results: string[] = [];
+  let matchCount = 0;
 
   for (const file of files) {
+    if (isBinaryExtension(file)) continue;
+
+    let fullPath: string;
     try {
-      const fullPath = await resolveRepoPath(repoName, file);
-      const stat = await fs.stat(fullPath);
-      if (stat.size > MAX_FILE_SIZE) continue;
-
-      const content = await fs.readFile(fullPath, 'utf-8');
-      const lines = content.split('\n');
-
-      for (let i = 0; i < lines.length; i++) {
-        const line = lines[i] ?? '';
-        if (line.toLowerCase().includes(lowerQuery)) {
-          if (contextLines > 0) {
-            // With context: show surrounding lines
-            const ctxStart = Math.max(0, i - contextLines);
-            const ctxEnd = Math.min(lines.length - 1, i + contextLines);
-            results.push(`--- ${file}:${i + 1} ---`);
-            for (let j = ctxStart; j <= ctxEnd; j++) {
-              const prefix = j === i ? '> ' : '  ';
-              results.push(`${prefix}${j + 1}: ${lines[j] ?? ''}`);
-            }
-            results.push('');
-          } else {
-            results.push(`${file}:${i + 1}: ${line.trim()}`);
-          }
-
-          if (results.length >= maxResults) {
-            results.push(`\n[Search truncated at ${maxResults} results. Use 'path' or 'extensions' to narrow scope.]`);
-            return results.join('\n');
-          }
-        }
-      }
+      fullPath = await resolveRepoPath(repoName, file);
     } catch {
       continue;
     }
+
+    let stat;
+    try {
+      stat = await fs.stat(fullPath);
+    } catch {
+      continue;
+    }
+    if (stat.size > MAX_FILE_SIZE * 10) continue; // skip huge files (>2MB)
+
+    try {
+      if (await looksBinary(fullPath)) continue;
+    } catch {
+      continue;
+    }
+
+    let content: string;
+    try {
+      content = await fs.readFile(fullPath, 'utf-8');
+    } catch {
+      continue;
+    }
+
+    const lines = content.split('\n');
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i] ?? '';
+      pattern.lastIndex = 0;
+      if (!pattern.test(line)) continue;
+
+      matchCount++;
+      if (contextLines > 0) {
+        const ctxStart = Math.max(0, i - contextLines);
+        const ctxEnd = Math.min(lines.length - 1, i + contextLines);
+        results.push(`--- ${file}:${i + 1} ---`);
+        for (let j = ctxStart; j <= ctxEnd; j++) {
+          const prefix = j === i ? '> ' : '  ';
+          results.push(`${prefix}${j + 1}: ${lines[j] ?? ''}`);
+        }
+        results.push('');
+      } else {
+        results.push(`${file}:${i + 1}: ${line.trim()}`);
+      }
+
+      if (matchCount >= maxResults) {
+        results.push(`\n[Search truncated at ${maxResults} results. Use 'path' or 'extensions' to narrow scope.]`);
+        return results.join('\n');
+      }
+    }
   }
 
-  if (results.length === 0) {
-    return 'No matches found.';
-  }
-
+  if (results.length === 0) return 'No matches found.';
   return results.join('\n');
 }
 
-// ─── New Tools ───────────────────────────────────────────────
+// ─── getTree ─────────────────────────────────────────────────
 
-/**
- * Get a visual directory tree of a repository.
- * Useful for understanding repo structure without listing every file.
- */
 export async function getTree(
   repoName: string,
   options: {
@@ -272,9 +354,10 @@ export async function getTree(
   const rootLabel = subPath || repoName;
   lines.push(`${rootLabel}/`);
 
+  const ignoreSet = new Set(IGNORE_DIRS);
+
   async function walk(dir: string, prefix: string, depth: number) {
     if (depth > maxDepth) return;
-
     let entries: string[];
     try {
       entries = await fs.readdir(dir);
@@ -282,17 +365,14 @@ export async function getTree(
       return;
     }
 
-    // Filter out ignored directories/files
-    entries = entries.filter(e => {
-      if (e === '.git' || e === 'node_modules' || e === '__pycache__' || e === '.next' || e === '.nuxt' || e === '.svelte-kit' || e === 'vendor' || e === 'target') return false;
+    entries = entries.filter((e) => {
+      if (ignoreSet.has(e)) return false;
       if (e.startsWith('.') && e !== '.github') return false;
       return true;
     });
 
-    // Sort: directories first, then files
     const dirEntries: string[] = [];
     const fileEntries: string[] = [];
-
     for (const entry of entries) {
       const fullPath = path.join(dir, entry);
       try {
@@ -304,59 +384,45 @@ export async function getTree(
       }
     }
 
-    // Apply extension filter to files
     let filteredFiles = fileEntries;
     if (options.extensions?.length) {
-      filteredFiles = fileEntries.filter(f => {
+      filteredFiles = fileEntries.filter((f) => {
         const ext = path.extname(f).toLowerCase();
-        return options.extensions!.some(e => e.toLowerCase() === ext || `.${e.toLowerCase()}` === ext);
+        return options.extensions!.some(
+          (e) => e.toLowerCase() === ext || `.${e.toLowerCase()}` === ext,
+        );
       });
     }
 
     const sorted = [...dirEntries.sort(), ...(showFiles ? filteredFiles.sort() : [])];
     const total = sorted.length;
-
     for (let i = 0; i < total; i++) {
       const entry = sorted[i]!;
       const isLast = i === total - 1;
       const connector = isLast ? '└── ' : '├── ';
       const childPrefix = isLast ? '    ' : '│   ';
       const isDir = dirEntries.includes(entry);
-
       lines.push(`${prefix}${connector}${entry}${isDir ? '/' : ''}`);
-
-      if (isDir) {
-        await walk(path.join(dir, entry), prefix + childPrefix, depth + 1);
-      }
+      if (isDir) await walk(path.join(dir, entry), prefix + childPrefix, depth + 1);
     }
   }
 
   await walk(targetPath, '', 1);
-
-  if (lines.length === 1) {
-    return `${rootLabel}/ (empty or all entries filtered)`;
-  }
-
+  if (lines.length === 1) return `${rootLabel}/ (empty or all entries filtered)`;
   return lines.join('\n');
 }
 
-/**
- * Smart documentation discovery.
- * Finds README, docs/, and documentation files with preview snippets.
- */
+// ─── findDocs ────────────────────────────────────────────────
+
 export async function findDocs(
   repoName: string,
-  options: {
-    topic?: string;
-  } = {},
+  options: { topic?: string } = {},
 ) {
   const repoPath = await resolveRepoPath(repoName);
-
   if (!(await fs.pathExists(repoPath))) {
     throw new Error(`Repository not found: ${repoName}`);
   }
 
-  // 1. Find all documentation files
   const docGlob = extensionsToGlob(DOC_EXTENSIONS);
   const allDocFiles = await glob(docGlob, {
     cwd: repoPath,
@@ -365,7 +431,6 @@ export async function findDocs(
     onlyFiles: true,
   });
 
-  // 2. Score and sort by relevance
   type ScoredFile = { file: string; score: number; size: number };
   const scored: ScoredFile[] = [];
 
@@ -374,19 +439,10 @@ export async function findDocs(
     const lower = file.toLowerCase();
     const basename = path.basename(lower, path.extname(lower));
 
-    // Boost known doc filenames
-    if (DOC_FILENAMES.some(name => basename.includes(name))) score += 10;
-
-    // Boost files in docs/ or documentation/ directories
+    if (DOC_FILENAMES.some((name) => basename.includes(name))) score += 10;
     if (lower.startsWith('docs/') || lower.startsWith('documentation/') || lower.includes('/docs/')) score += 5;
-
-    // Boost root-level files
     if (!file.includes('/') && !file.includes('\\')) score += 3;
-
-    // Boost README specifically
     if (basename === 'readme') score += 20;
-
-    // Topic matching
     if (options.topic) {
       const lowerTopic = options.topic.toLowerCase();
       if (lower.includes(lowerTopic)) score += 15;
@@ -401,33 +457,24 @@ export async function findDocs(
     }
   }
 
-  // Sort by score descending
   scored.sort((a, b) => b.score - a.score);
-
-  // 3. Build output with previews for top files
   const topFiles = scored.slice(0, 30);
+
   const results: string[] = [];
   results.push(`Found ${scored.length} documentation files in "${repoName}".`);
+  if (scored.length > 30) results.push(`Showing top 30 most relevant.\n`);
+  else results.push('');
 
-  if (scored.length > 30) {
-    results.push(`Showing top 30 most relevant.\n`);
-  } else {
-    results.push('');
-  }
-
-  // Show preview for top 5 files
   const previewCount = Math.min(5, topFiles.length);
   for (let i = 0; i < topFiles.length; i++) {
     const { file, size } = topFiles[i]!;
-
     if (i < previewCount) {
-      // Show preview (first 5 lines)
       try {
         const fullPath = path.join(repoPath, file);
         const content = await fs.readFile(fullPath, 'utf-8');
-        const previewLines = content.split('\n').slice(0, 5).map(l => `    ${l}`).join('\n');
+        const previewLines = content.split('\n').slice(0, 5).map((l) => `    ${l}`).join('\n');
         results.push(`📄 ${file} (${formatSize(size)})`);
-        results.push(`${previewLines}`);
+        results.push(previewLines);
         results.push('');
       } catch {
         results.push(`📄 ${file} (${formatSize(size)})`);
@@ -437,23 +484,16 @@ export async function findDocs(
     }
   }
 
-  if (topFiles.length === 0) {
-    return `No documentation files found in "${repoName}".`;
-  }
-
+  if (topFiles.length === 0) return `No documentation files found in "${repoName}".`;
   return results.join('\n');
 }
 
-/**
- * Read multiple files in a single call.
- * Each file is capped at a smaller limit (10KB) to prevent context overflow.
- */
+// ─── batchRead ───────────────────────────────────────────────
+
 export async function batchRead(
   repoName: string,
   paths: string[],
-  options: {
-    maxSizePerFile?: number;
-  } = {},
+  options: { maxSizePerFile?: number } = {},
 ) {
   const maxSize = options.maxSizePerFile ?? BATCH_MAX_PER_FILE;
   const results: string[] = [];
@@ -465,12 +505,10 @@ export async function batchRead(
 
     try {
       const targetPath = await resolveRepoPath(repoName, filePath);
-
       if (!(await fs.pathExists(targetPath))) {
         results.push('[ERROR: File not found]');
         continue;
       }
-
       const stat = await fs.stat(targetPath);
       if (!stat.isFile()) {
         results.push('[ERROR: Path is not a file]');
@@ -480,8 +518,11 @@ export async function batchRead(
       if (stat.size > maxSize) {
         const buffer = Buffer.alloc(maxSize);
         const fd = await fs.open(targetPath, 'r');
-        await fs.read(fd, buffer, 0, maxSize, 0);
-        await fs.close(fd);
+        try {
+          await fs.read(fd, buffer, 0, maxSize, 0);
+        } finally {
+          await fs.close(fd);
+        }
         results.push(`[WARNING: Truncated from ${formatSize(stat.size)} to ${formatSize(maxSize)}]\n`);
         results.push(buffer.toString('utf-8'));
       } else {
@@ -492,6 +533,227 @@ export async function batchRead(
       results.push(`[ERROR: ${err.message}]`);
     }
   }
-
   return results.join('\n');
+}
+
+// ─── findFiles (NEW) ─────────────────────────────────────────
+
+/**
+ * Find files by glob pattern. e.g. "**\/*Config*.ts", "src/**\/*.py"
+ */
+export async function findFiles(
+  repoName: string,
+  pattern: string,
+  options: {
+    path?: string;
+    maxResults?: number;
+  } = {},
+) {
+  const basePath = options.path || '';
+  const targetPath = await resolveRepoPath(repoName, basePath);
+
+  if (!(await fs.pathExists(targetPath))) {
+    throw new Error(`Path not found: ${basePath || repoName}`);
+  }
+
+  const max = options.maxResults ?? 200;
+  const entries = await glob(pattern, {
+    cwd: targetPath,
+    dot: false,
+    ignore: IGNORE_PATTERNS,
+    onlyFiles: true,
+    caseSensitiveMatch: false,
+  });
+
+  const truncated = entries.length > max;
+  const sliced = entries.slice(0, max);
+  const formatted = sliced.map((e) => path.join(basePath, e).replace(/\\/g, '/'));
+
+  if (formatted.length === 0) return `No files matched pattern "${pattern}".`;
+  let out = `Found ${entries.length} file(s) matching "${pattern}"`;
+  if (truncated) out += ` (showing first ${max})`;
+  return out + ':\n' + formatted.join('\n');
+}
+
+// ─── findSymbol (NEW) ────────────────────────────────────────
+
+type SymbolKind = 'function' | 'class' | 'method' | 'interface' | 'type' | 'const' | 'any';
+
+interface SymbolPattern {
+  kind: SymbolKind;
+  regex: (name: string) => RegExp;
+  langs: string[];
+}
+
+const SYMBOL_PATTERNS: SymbolPattern[] = [
+  // TypeScript / JavaScript
+  { kind: 'function', langs: ['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs'],
+    regex: (n) => new RegExp(`^\\s*(?:export\\s+)?(?:async\\s+)?function\\s+${n}\\b`) },
+  { kind: 'function', langs: ['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs'],
+    regex: (n) => new RegExp(`^\\s*(?:export\\s+)?(?:const|let|var)\\s+${n}\\s*[:=]\\s*(?:async\\s*)?(?:\\([^)]*\\)|[a-zA-Z_$<])`) },
+  { kind: 'class', langs: ['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs'],
+    regex: (n) => new RegExp(`^\\s*(?:export\\s+)?(?:abstract\\s+)?class\\s+${n}\\b`) },
+  { kind: 'interface', langs: ['.ts', '.tsx'],
+    regex: (n) => new RegExp(`^\\s*(?:export\\s+)?interface\\s+${n}\\b`) },
+  { kind: 'type', langs: ['.ts', '.tsx'],
+    regex: (n) => new RegExp(`^\\s*(?:export\\s+)?type\\s+${n}\\b`) },
+
+  // Python
+  { kind: 'function', langs: ['.py'],
+    regex: (n) => new RegExp(`^\\s*(?:async\\s+)?def\\s+${n}\\s*\\(`) },
+  { kind: 'class', langs: ['.py'],
+    regex: (n) => new RegExp(`^\\s*class\\s+${n}\\b`) },
+
+  // Go
+  { kind: 'function', langs: ['.go'],
+    regex: (n) => new RegExp(`^\\s*func\\s+(?:\\([^)]*\\)\\s+)?${n}\\s*\\(`) },
+  { kind: 'type', langs: ['.go'],
+    regex: (n) => new RegExp(`^\\s*type\\s+${n}\\b`) },
+
+  // Rust
+  { kind: 'function', langs: ['.rs'],
+    regex: (n) => new RegExp(`^\\s*(?:pub\\s+)?(?:async\\s+)?fn\\s+${n}\\b`) },
+  { kind: 'class', langs: ['.rs'],
+    regex: (n) => new RegExp(`^\\s*(?:pub\\s+)?struct\\s+${n}\\b`) },
+
+  // Java / Kotlin / C#
+  { kind: 'class', langs: ['.java', '.kt', '.cs'],
+    regex: (n) => new RegExp(`^\\s*(?:public|private|protected|internal|abstract|final|static|\\s)*\\s*class\\s+${n}\\b`) },
+  { kind: 'interface', langs: ['.java', '.kt', '.cs'],
+    regex: (n) => new RegExp(`^\\s*(?:public|private|protected|internal|\\s)*\\s*interface\\s+${n}\\b`) },
+
+  // PHP
+  { kind: 'function', langs: ['.php'],
+    regex: (n) => new RegExp(`^\\s*(?:public|private|protected|static|\\s)*\\s*function\\s+${n}\\s*\\(`) },
+  { kind: 'class', langs: ['.php'],
+    regex: (n) => new RegExp(`^\\s*(?:abstract\\s+|final\\s+)?class\\s+${n}\\b`) },
+
+  // Ruby
+  { kind: 'function', langs: ['.rb'],
+    regex: (n) => new RegExp(`^\\s*def\\s+(?:self\\.)?${n}\\b`) },
+  { kind: 'class', langs: ['.rb'],
+    regex: (n) => new RegExp(`^\\s*class\\s+${n}\\b`) },
+];
+
+/**
+ * Find function/class/etc. definitions for a given symbol name across the repo.
+ * Returns location + line for each match.
+ */
+export async function findSymbol(
+  repoName: string,
+  name: string,
+  options: {
+    kind?: SymbolKind;
+    extensions?: string[];
+    path?: string;
+    maxResults?: number;
+  } = {},
+) {
+  if (!/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(name)) {
+    throw new Error('Symbol name must be a valid identifier (letters, digits, _, $).');
+  }
+
+  const basePath = options.path || '';
+  const targetPath = await resolveRepoPath(repoName, basePath);
+  if (!(await fs.pathExists(targetPath))) {
+    throw new Error(`Path not found: ${basePath || repoName}`);
+  }
+
+  // Use extensions filter if provided, else union of all known langs.
+  const langExts = options.extensions?.length
+    ? options.extensions.map((e) => e.startsWith('.') ? e.toLowerCase() : `.${e.toLowerCase()}`)
+    : Array.from(new Set(SYMBOL_PATTERNS.flatMap((p) => p.langs)));
+
+  const files = await listFiles(repoName, basePath, { extensions: langExts });
+
+  type Hit = { file: string; line: number; kind: SymbolKind; preview: string };
+  const hits: Hit[] = [];
+  const max = options.maxResults ?? 50;
+
+  for (const file of files) {
+    const ext = path.extname(file).toLowerCase();
+    const applicable = SYMBOL_PATTERNS.filter((p) => {
+      if (options.kind && options.kind !== 'any' && p.kind !== options.kind) return false;
+      return p.langs.includes(ext);
+    });
+    if (applicable.length === 0) continue;
+
+    let fullPath: string;
+    try {
+      fullPath = await resolveRepoPath(repoName, file);
+    } catch {
+      continue;
+    }
+    let content: string;
+    try {
+      const stat = await fs.stat(fullPath);
+      if (stat.size > MAX_FILE_SIZE * 10) continue;
+      content = await fs.readFile(fullPath, 'utf-8');
+    } catch {
+      continue;
+    }
+
+    const lines = content.split('\n');
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i] ?? '';
+      for (const p of applicable) {
+        if (p.regex(name).test(line)) {
+          hits.push({ file, line: i + 1, kind: p.kind, preview: line.trim() });
+          break; // one kind per line is enough
+        }
+      }
+      if (hits.length >= max) break;
+    }
+    if (hits.length >= max) break;
+  }
+
+  if (hits.length === 0) return `No definition found for symbol "${name}".`;
+
+  // Group by kind for readability
+  const out: string[] = [`Found ${hits.length} definition(s) for "${name}":\n`];
+  for (const h of hits) {
+    out.push(`[${h.kind}] ${h.file}:${h.line}`);
+    out.push(`  ${h.preview}`);
+  }
+  return out.join('\n');
+}
+
+// ─── searchAllRepos (NEW) ────────────────────────────────────
+
+export async function searchAllRepos(
+  query: string,
+  options: {
+    extensions?: string[];
+    maxResultsPerRepo?: number;
+    caseSensitive?: boolean;
+    regex?: boolean;
+    wholeWord?: boolean;
+  } = {},
+) {
+  const config = await getConfig();
+  const repoNames = Object.keys(config.repos);
+  if (repoNames.length === 0) return 'No repositories configured.';
+
+  const perRepo = options.maxResultsPerRepo ?? 10;
+  const out: string[] = [`Searching for "${query}" across ${repoNames.length} repos...\n`];
+
+  for (const name of repoNames) {
+    try {
+      const result = await searchCode(name, query, {
+        extensions: options.extensions,
+        maxResults: perRepo,
+        caseSensitive: options.caseSensitive,
+        regex: options.regex,
+        wholeWord: options.wholeWord,
+      });
+      if (result === 'No matches found.') continue;
+      out.push(`\n━━━ ${name} ━━━`);
+      out.push(result);
+    } catch (err: any) {
+      out.push(`\n━━━ ${name} (error: ${err.message}) ━━━`);
+    }
+  }
+
+  if (out.length === 1) return out[0] + '\nNo matches in any repo.';
+  return out.join('\n');
 }

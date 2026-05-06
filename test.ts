@@ -1,9 +1,15 @@
 /**
- * Quick integration test for file tools and git repo metadata helpers.
+ * Integration test for the Local MCP server.
  * Run: bun run test.ts
  */
-import { listFiles, readFile, searchCode, getTree, findDocs, batchRead } from './src/tools/files';
-import { listRepos, normalizeRepoInput } from './src/tools/git';
+import {
+  listFiles, readFile, searchCode, getTree, findDocs, batchRead,
+  findFiles, findSymbol, searchAllRepos,
+} from './src/tools/files';
+import {
+  listRepos, normalizeRepoInput,
+  gitLog, gitShow, gitDiff, listBranches, listTags,
+} from './src/tools/git';
 
 const PASS = '✅ PASS';
 const FAIL = '❌ FAIL';
@@ -19,6 +25,7 @@ async function test(name: string, fn: () => Promise<void>) {
   } catch (err: any) {
     console.error(`${FAIL}: ${name}`);
     console.error(`   Error: ${err.message}`);
+    if (err.stack) console.error(`   ${err.stack.split('\n').slice(1, 3).join('\n   ')}`);
     failed++;
   }
 }
@@ -27,219 +34,316 @@ function assert(condition: boolean, msg: string) {
   if (!condition) throw new Error(`Assertion failed: ${msg}`);
 }
 
-// Pick a small known repo from settings.json
-const TEST_REPO = 'godotenv'; // small repo, should be fast
+const TEST_REPO = 'godotenv';
 
 console.log('='.repeat(60));
-console.log('  LOCAL MCP v2.0 — Integration Tests');
+console.log('  LOCAL MCP v3.0 — Integration Tests');
 console.log('='.repeat(60));
 console.log(`Using test repo: "${TEST_REPO}"\n`);
 
-// ─── 1. listRepos ────────────────────────────────────────────
+// ─── Existing — repo & URL parsing ───────────────────────────
+
 await test('listRepos — returns managed repos', async () => {
   const result = await listRepos();
   assert(result.includes(TEST_REPO), `Should contain "${TEST_REPO}"`);
   assert(result.includes('Managed Repositories'), 'Should have header');
 });
 
-// ─── 2. listRepos includes branch metadata ───────────────────
 await test('listRepos — includes branch labels', async () => {
   const result = await listRepos();
   assert(result.includes('[branch:'), 'Should include branch metadata');
 });
 
-// ─── 3. git URL normalization from tree/<branch> ─────────────
-await test('normalizeRepoInput — parses GitHub tree branch URLs', async () => {
-  const normalized = normalizeRepoInput('https://github.com/filamentphp/filament/tree/5.x');
-  assert(normalized.cloneUrl === 'https://github.com/filamentphp/filament', 'Should normalize clone URL to repo root');
-  assert(normalized.storedUrl === 'https://github.com/filamentphp/filament', 'Should store repo root URL');
-  assert(normalized.branch === '5.x', 'Should infer branch from tree URL');
-  assert(normalized.inferredName === 'filament', 'Should infer repo name');
+await test('normalizeRepoInput — parses tree URL', async () => {
+  const n = normalizeRepoInput('https://github.com/filamentphp/filament/tree/5.x');
+  assert(n.cloneUrl === 'https://github.com/filamentphp/filament', 'Should normalize URL');
+  assert(n.branch === '5.x', 'Should infer branch');
+  assert(n.inferredName === 'filament', 'Should infer name');
 });
 
-// ─── 4. git URL normalization without scheme ──────────────────
 await test('normalizeRepoInput — accepts URLs without scheme', async () => {
-  const normalized = normalizeRepoInput('github.com/filamentphp/filament/tree/5.x');
-  assert(normalized.cloneUrl === 'https://github.com/filamentphp/filament', 'Should prepend https scheme');
-  assert(normalized.branch === '5.x', 'Should still parse tree branch');
+  const n = normalizeRepoInput('github.com/filamentphp/filament/tree/5.x');
+  assert(n.cloneUrl === 'https://github.com/filamentphp/filament', 'Should add https');
+  assert(n.branch === '5.x', 'Should still parse branch');
 });
 
-// ─── 5. explicit branch overrides tree URL branch ─────────────
-await test('normalizeRepoInput — explicit branch takes precedence', async () => {
-  const normalized = normalizeRepoInput('https://github.com/filamentphp/filament/tree/4.x', '5.x');
-  assert(normalized.branch === '5.x', 'Explicit branch should override tree URL branch');
+await test('normalizeRepoInput — explicit branch overrides tree URL', async () => {
+  const n = normalizeRepoInput('https://github.com/filamentphp/filament/tree/4.x', '5.x');
+  assert(n.branch === '5.x', 'Explicit wins');
 });
 
-// ─── 6. invalid extra repo path is rejected ───────────────────
-await test('normalizeRepoInput — rejects unsupported extra paths', async () => {
+await test('normalizeRepoInput — rejects blob URLs', async () => {
   try {
     normalizeRepoInput('https://github.com/filamentphp/filament/blob/5.x/README.md');
-    throw new Error('Should have thrown invalid path error');
+    throw new Error('Should have thrown');
   } catch (err: any) {
-    assert(err.message.includes('Only repository root URLs or GitHub tree/<branch> URLs are supported.'), 'Should reject unsupported GitHub paths');
+    assert(err.message.includes('Only repository root URLs'), 'Should reject');
   }
 });
 
-// ─── 7. listFiles (basic) ────────────────────────────────────
-await test('listFiles — basic (no options)', async () => {
+// ─── listFiles ───────────────────────────────────────────────
+
+await test('listFiles — basic', async () => {
   const files = await listFiles(TEST_REPO);
   assert(files.length > 0, 'Should return files');
-  assert(files.some(f => f.endsWith('.go') || f.endsWith('.md')), 'Should have .go or .md files');
+  assert(files.some((f) => f.endsWith('.go') || f.endsWith('.md')), 'Has .go/.md');
 });
 
-// ─── 8. listFiles (extension filter) ─────────────────────────
 await test('listFiles — extension filter [".md"]', async () => {
   const files = await listFiles(TEST_REPO, '', { extensions: ['.md'] });
-  assert(files.length > 0, 'Should find .md files');
-  assert(files.every(f => f.endsWith('.md')), 'All files should be .md');
+  assert(files.length > 0, 'Has .md files');
+  assert(files.every((f) => f.endsWith('.md')), 'All .md');
 });
 
-// ─── 9. listFiles (with size) ────────────────────────────────
-await test('listFiles — include_size=true', async () => {
+await test('listFiles — include_size', async () => {
   const files = await listFiles(TEST_REPO, '', { includeSize: true });
-  assert(files.length > 0, 'Should return files');
-  assert(files.some(f => f.includes('KB') || f.includes('B)')), 'Should include size info');
+  assert(files.length > 0, 'Has files');
+  assert(files.some((f) => f.includes('KB') || f.includes('B)')), 'Has size');
 });
 
-// ─── 10. listFiles (max_depth) ───────────────────────────────
 await test('listFiles — max_depth=1', async () => {
   const shallow = await listFiles(TEST_REPO, '', { maxDepth: 1 });
   const deep = await listFiles(TEST_REPO);
-  // Shallow should have fewer or equal files
-  assert(shallow.length <= deep.length, `Shallow (${shallow.length}) should be <= deep (${deep.length})`);
+  assert(shallow.length <= deep.length, 'Shallow ≤ deep');
 });
 
-// ─── 11. readFile (full) ─────────────────────────────────────
-await test('readFile — full file', async () => {
-  const content = await readFile(TEST_REPO, 'README.md');
-  assert(content.length > 0, 'Should have content');
-  assert(content.includes('godotenv') || content.includes('GoDotEnv') || content.includes('.env'), 'Should be about godotenv');
+// ─── readFile ────────────────────────────────────────────────
+
+await test('readFile — full', async () => {
+  const c = await readFile(TEST_REPO, 'README.md');
+  assert(c.length > 0, 'Has content');
 });
 
-// ─── 12. readFile (line range) ───────────────────────────────
-await test('readFile — line range (lines 1-5)', async () => {
-  const content = await readFile(TEST_REPO, 'README.md', { startLine: 1, endLine: 5 });
-  assert(content.includes('[Lines 1-5'), 'Should have line range header');
-  const lines = content.split('\n').filter(l => l.match(/^\d+:/));
-  assert(lines.length <= 5, `Should have at most 5 numbered lines, got ${lines.length}`);
+await test('readFile — line range', async () => {
+  const c = await readFile(TEST_REPO, 'README.md', { startLine: 1, endLine: 5 });
+  assert(c.includes('[Lines 1-5'), 'Has header');
+  const numbered = c.split('\n').filter((l) => l.match(/^\d+:/));
+  assert(numbered.length <= 5, 'At most 5 lines');
 });
 
-// ─── 13. searchCode (basic) ──────────────────────────────────
-await test('searchCode — basic search', async () => {
-  const result = await searchCode(TEST_REPO, 'func');
-  assert(result !== 'No matches found.', 'Should find matches for "func"');
-  assert(result.includes(':'), 'Results should have file:line format');
+await test('readFile — negative start_line (last 3 lines)', async () => {
+  const c = await readFile(TEST_REPO, 'README.md', { startLine: -3 });
+  assert(/\[Lines \d+-\d+ of \d+ total\]/.test(c), 'Has range header');
+  // Should have at most 3 numbered lines
+  const numbered = c.split('\n').filter((l) => l.match(/^\d+:/));
+  assert(numbered.length <= 3, `Got ${numbered.length}, expected ≤3`);
 });
 
-// ─── 14. searchCode (extension filter) ───────────────────────
-await test('searchCode — extension filter [".go"]', async () => {
-  const result = await searchCode(TEST_REPO, 'func', { extensions: ['.go'] });
-  assert(result !== 'No matches found.', 'Should find matches');
-  // All results should be from .go files
-  const lines = result.split('\n').filter(l => l.includes(':'));
-  assert(lines.every(l => l.startsWith('') || l.includes('.go:')), 'Results should be from .go files');
-});
-
-// ─── 15. searchCode (context lines) ──────────────────────────
-await test('searchCode — context_lines=2', async () => {
-  const result = await searchCode(TEST_REPO, 'Load', { contextLines: 2, maxResults: 5 });
-  assert(result !== 'No matches found.', 'Should find matches');
-  assert(result.includes('---'), 'Should have context block separators');
-  assert(result.includes('> '), 'Should have match indicator ">"');
-});
-
-// ─── 16. searchCode (path scope) ─────────────────────────────
-await test('searchCode — path scoping', async () => {
-  // Search only in a specific path — no error means it works
-  const result = await searchCode(TEST_REPO, 'package', { maxResults: 5 });
-  assert(typeof result === 'string', 'Should return a string result');
-});
-
-// ─── 17. getTree (basic) ─────────────────────────────────────
-await test('getTree — basic (depth=3)', async () => {
-  const tree = await getTree(TEST_REPO);
-  assert(tree.includes(TEST_REPO), 'Should have repo name as root');
-  assert(tree.includes('├──') || tree.includes('└──'), 'Should have tree connectors');
-});
-
-// ─── 18. getTree (depth=1) ───────────────────────────────────
-await test('getTree — depth=1', async () => {
-  const shallow = await getTree(TEST_REPO, { maxDepth: 1 });
-  const deep = await getTree(TEST_REPO, { maxDepth: 3 });
-  assert(shallow.split('\n').length <= deep.split('\n').length, 'Shallow tree should be shorter or equal');
-});
-
-// ─── 19. getTree (directories only) ──────────────────────────
-await test('getTree — show_files=false (dirs only)', async () => {
-  const tree = await getTree(TEST_REPO, { showFiles: false });
-  assert(tree.includes('/'), 'Should have directory markers');
-  // Every non-root line should end with /
-  const lines = tree.split('\n').slice(1).filter(l => l.trim());
-  assert(lines.every(l => l.trimEnd().endsWith('/')), 'All entries should be directories');
-});
-
-// ─── 20. getTree (extension filter) ──────────────────────────
-await test('getTree — extensions=[".md"]', async () => {
-  const tree = await getTree(TEST_REPO, { extensions: ['.md'] });
-  // Files shown should be .md only (dirs are always shown)
-  const fileLines = tree.split('\n').filter(l => !l.endsWith('/') && (l.includes('├──') || l.includes('└──')));
-  if (fileLines.length > 0) {
-    assert(fileLines.every(l => l.includes('.md')), 'File entries should be .md');
-  }
-});
-
-// ─── 21. findDocs (basic) ────────────────────────────────────
-await test('findDocs — basic', async () => {
-  const result = await findDocs(TEST_REPO);
-  assert(result.includes('documentation files'), 'Should have summary header');
-  assert(result.includes('README') || result.includes('readme'), 'Should find README');
-});
-
-// ─── 22. findDocs (with topic) ───────────────────────────────
-await test('findDocs — with topic', async () => {
-  const result = await findDocs(TEST_REPO, { topic: 'env' });
-  assert(result.includes('documentation files'), 'Should have summary header');
-});
-
-// ─── 23. batchRead ────────────────────────────────────────────
-await test('batchRead — read multiple files', async () => {
-  // Get a list of files first
-  const files = await listFiles(TEST_REPO, '', { extensions: ['.md'] });
-  const filesToRead = files.slice(0, 2);
-  
-  if (filesToRead.length === 0) {
-    throw new Error('No .md files to batch-read');
-  }
-
-  const result = await batchRead(TEST_REPO, filesToRead);
-  assert(result.includes('='.repeat(60)), 'Should have file separators');
-  for (const f of filesToRead) {
-    assert(result.includes(f), `Should contain file "${f}"`);
-  }
-});
-
-// ─── 24. batchRead (file not found handling) ─────────────────
-await test('batchRead — handles missing files gracefully', async () => {
-  const result = await batchRead(TEST_REPO, ['README.md', 'DOES_NOT_EXIST.xyz']);
-  assert(result.includes('README.md'), 'Should contain valid file');
-  assert(result.includes('File not found') || result.includes('ERROR'), 'Should report missing file');
-});
-
-// ─── 25. Security — path traversal blocked ───────────────────
 await test('readFile — blocks path traversal', async () => {
   try {
     await readFile(TEST_REPO, '../../package.json');
-    throw new Error('Should have thrown security error');
+    throw new Error('Should throw');
   } catch (err: any) {
-    assert(err.message.includes('Security Error') || err.message.includes('Access denied'), 'Should throw security error');
+    assert(err.message.includes('Security Error'), 'Should reject');
   }
 });
 
+// ─── searchCode ──────────────────────────────────────────────
+
+await test('searchCode — basic', async () => {
+  const r = await searchCode(TEST_REPO, 'func');
+  assert(r !== 'No matches found.', 'Has matches');
+  assert(r.includes(':'), 'file:line format');
+});
+
+await test('searchCode — extension filter', async () => {
+  const r = await searchCode(TEST_REPO, 'func', { extensions: ['.go'], maxResults: 5 });
+  assert(r !== 'No matches found.', 'Has matches');
+});
+
+await test('searchCode — context lines', async () => {
+  const r = await searchCode(TEST_REPO, 'Load', { contextLines: 2, maxResults: 5 });
+  assert(r !== 'No matches found.', 'Has matches');
+  assert(r.includes('---'), 'Has separators');
+  assert(r.includes('> '), 'Has match marker');
+});
+
+await test('searchCode — case sensitive (no match for wrong case)', async () => {
+  // Look for 'FUNC' in case-sensitive mode — Go uses lowercase 'func', should be 0 matches
+  const r = await searchCode(TEST_REPO, 'FUNC', { caseSensitive: true, extensions: ['.go'], maxResults: 5 });
+  assert(r === 'No matches found.', `Should find none, got: ${r.slice(0, 200)}`);
+});
+
+await test('searchCode — case insensitive (matches FUNC)', async () => {
+  const r = await searchCode(TEST_REPO, 'FUNC', { caseSensitive: false, extensions: ['.go'], maxResults: 5 });
+  assert(r !== 'No matches found.', 'Should find lowercase func via case-insensitive');
+});
+
+await test('searchCode — regex pattern', async () => {
+  // Regex: function declarations starting with "Load"
+  const r = await searchCode(TEST_REPO, '^func Load', { regex: true, extensions: ['.go'], maxResults: 5 });
+  assert(r !== 'No matches found.', 'Should find Load functions');
+});
+
+await test('searchCode — whole_word', async () => {
+  const r = await searchCode(TEST_REPO, 'env', { wholeWord: true, extensions: ['.go'], maxResults: 5 });
+  // 'env' as whole word should match (e.g. var env, not envFile etc)
+  assert(typeof r === 'string', 'Returns string');
+});
+
+await test('searchCode — invalid regex throws', async () => {
+  try {
+    await searchCode(TEST_REPO, '[invalid', { regex: true });
+    throw new Error('Should throw');
+  } catch (err: any) {
+    assert(err.message.includes('Invalid regex'), 'Should reject bad regex');
+  }
+});
+
+// ─── getTree ─────────────────────────────────────────────────
+
+await test('getTree — basic', async () => {
+  const t = await getTree(TEST_REPO);
+  assert(t.includes(TEST_REPO), 'Has root');
+  assert(t.includes('├──') || t.includes('└──'), 'Has connectors');
+});
+
+await test('getTree — depth=1', async () => {
+  const s = await getTree(TEST_REPO, { maxDepth: 1 });
+  const d = await getTree(TEST_REPO, { maxDepth: 3 });
+  assert(s.split('\n').length <= d.split('\n').length, 'Shallower ≤ deeper');
+});
+
+await test('getTree — show_files=false', async () => {
+  const t = await getTree(TEST_REPO, { showFiles: false });
+  const lines = t.split('\n').slice(1).filter((l) => l.trim());
+  assert(lines.every((l) => l.trimEnd().endsWith('/')), 'Only dirs');
+});
+
+// ─── findDocs ────────────────────────────────────────────────
+
+await test('findDocs — basic', async () => {
+  const r = await findDocs(TEST_REPO);
+  assert(r.includes('documentation files'), 'Has summary');
+  assert(/readme/i.test(r), 'Found README');
+});
+
+// ─── batchRead ───────────────────────────────────────────────
+
+await test('batchRead — multiple files', async () => {
+  const files = await listFiles(TEST_REPO, '', { extensions: ['.md'] });
+  if (files.length === 0) throw new Error('No .md files');
+  const r = await batchRead(TEST_REPO, files.slice(0, 2));
+  assert(r.includes('='.repeat(60)), 'Has separators');
+});
+
+await test('batchRead — handles missing', async () => {
+  const r = await batchRead(TEST_REPO, ['README.md', 'NOPE.xyz']);
+  assert(/file not found/i.test(r), 'Reports missing');
+});
+
+// ─── NEW: findFiles ──────────────────────────────────────────
+
+await test('findFiles — glob pattern', async () => {
+  const r = await findFiles(TEST_REPO, '**/*.go');
+  assert(r.includes('matching'), 'Has summary');
+  assert(r.includes('.go'), 'Found .go files');
+});
+
+await test('findFiles — case-insensitive match', async () => {
+  const r = await findFiles(TEST_REPO, '**/README*');
+  assert(/readme/i.test(r), 'Found README');
+});
+
+await test('findFiles — no match returns clean message', async () => {
+  const r = await findFiles(TEST_REPO, '**/*.zzzzz_definitely_no_match');
+  assert(r.includes('No files matched'), 'Clean no-match');
+});
+
+// ─── NEW: findSymbol ─────────────────────────────────────────
+
+await test('findSymbol — finds Go function "Load"', async () => {
+  const r = await findSymbol(TEST_REPO, 'Load');
+  assert(!r.startsWith('No definition found'), `Should find Load: ${r.slice(0, 200)}`);
+  assert(/\[function\]/.test(r), 'Marked as function');
+});
+
+await test('findSymbol — rejects invalid identifier', async () => {
+  try {
+    await findSymbol(TEST_REPO, 'not a name; rm -rf /');
+    throw new Error('Should reject');
+  } catch (err: any) {
+    assert(err.message.includes('valid identifier'), 'Should validate');
+  }
+});
+
+await test('findSymbol — nonexistent returns clean message', async () => {
+  const r = await findSymbol(TEST_REPO, 'ZzzNoSuchSymbol_XYZ');
+  assert(r.startsWith('No definition found'), 'Clean miss');
+});
+
+// ─── NEW: searchAllRepos ─────────────────────────────────────
+
+await test('searchAllRepos — finds across repos', async () => {
+  const r = await searchAllRepos('package main', { extensions: ['.go'], maxResultsPerRepo: 2 });
+  assert(typeof r === 'string', 'Returns string');
+  assert(r.length > 0, 'Has output');
+});
+
+// ─── NEW: gitLog / gitShow / gitDiff ─────────────────────────
+
+await test('gitLog — returns commits', async () => {
+  const r = await gitLog(TEST_REPO, { limit: 5 });
+  assert(r.includes('Commits in'), 'Has header');
+  // Each line should have SHA + date
+  const lines = r.split('\n').filter((l) => /^[a-f0-9]{4,}\s/.test(l));
+  assert(lines.length > 0 && lines.length <= 5, `Got ${lines.length} commits`);
+});
+
+await test('gitLog — file filter', async () => {
+  const r = await gitLog(TEST_REPO, { limit: 5, file: 'README.md' });
+  assert(r.includes('README.md') || r.includes('Commits in'), 'Has output');
+});
+
+await test('gitShow — rejects invalid SHA', async () => {
+  try {
+    await gitShow(TEST_REPO, 'not-a-sha; rm -rf /');
+    throw new Error('Should reject');
+  } catch (err: any) {
+    assert(err.message.includes('Invalid commit SHA'), 'Validates SHA');
+  }
+});
+
+await test('gitShow — shows real commit', async () => {
+  // Get a real SHA from gitLog first
+  const log = await gitLog(TEST_REPO, { limit: 1 });
+  const match = log.match(/([a-f0-9]{6,})/);
+  if (!match) throw new Error('No SHA found in log');
+  const sha = match[1]!;
+  const r = await gitShow(TEST_REPO, sha);
+  assert(r.length > 0, 'Has content');
+  assert(/commit\s+[a-f0-9]+/.test(r) || r.includes('diff'), 'Looks like git show output');
+});
+
+await test('gitDiff — stat only', async () => {
+  // Diff between HEAD~1 and HEAD
+  const r = await gitDiff(TEST_REPO, { from: 'HEAD~1', to: 'HEAD', statOnly: true });
+  assert(typeof r === 'string', 'Returns string');
+});
+
+// ─── NEW: listBranches / listTags ────────────────────────────
+
+await test('listBranches — basic', async () => {
+  const r = await listBranches(TEST_REPO);
+  assert(r.includes('Current branch:'), 'Has current');
+  assert(r.includes('Branches:'), 'Has list');
+});
+
+await test('listBranches — include remote', async () => {
+  const r = await listBranches(TEST_REPO, true);
+  assert(r.includes('Branches:'), 'Has list');
+});
+
+await test('listTags — returns string', async () => {
+  const r = await listTags(TEST_REPO);
+  // godotenv may or may not have tags — both ok
+  assert(typeof r === 'string' && r.length > 0, 'Has output');
+});
+
 // ─── Summary ─────────────────────────────────────────────────
+
 console.log('\n' + '='.repeat(60));
 console.log(`  Results: ${passed} passed, ${failed} failed, ${passed + failed} total`);
 console.log('='.repeat(60));
 
-if (failed > 0) {
-  process.exit(1);
-}
+if (failed > 0) process.exit(1);

@@ -58,18 +58,27 @@ async function getCurrentBranch(repoPath: string): Promise<string | undefined> {
   return branch && branch !== 'HEAD' ? branch : undefined;
 }
 
+async function resolveRepoPath(name: string): Promise<string> {
+  const config = await getConfig();
+  if (!config.repos[name]) throw new Error(`Repository "${name}" not found.`);
+  const repoPath = path.resolve(process.cwd(), config.storagePath, name);
+  if (!(await fs.pathExists(repoPath))) {
+    throw new Error(`Repository directory missing: ${name}`);
+  }
+  return repoPath;
+}
+
 /**
  * Clones a repository to local storage and updates config.
  */
 export async function addRepo(url: string, name?: string, branch?: string) {
   const config = await getConfig();
   const normalized = normalizeRepoInput(url, branch);
-  
-  // Basic security: avoid directory traversal
+
   const safeName = (name || normalized.inferredName || 'unknown')
     .replace(/[\\/.]/g, '_')
     .replace(/_{2,}/g, '_');
-     
+
   const targetPath = path.resolve(process.cwd(), config.storagePath, safeName);
 
   if (await fs.pathExists(targetPath)) {
@@ -77,7 +86,7 @@ export async function addRepo(url: string, name?: string, branch?: string) {
   }
 
   await fs.ensureDir(path.dirname(targetPath));
-  
+
   const git = simpleGit();
   try {
     console.error(`Cloning ${normalized.cloneUrl} into ${targetPath}...`);
@@ -102,7 +111,6 @@ export async function addRepo(url: string, name?: string, branch?: string) {
 
     return `Repository "${safeName}" cloned successfully${branchSuffix}.`;
   } catch (error: any) {
-    // Cleanup if directory was created but clone failed
     if (await fs.pathExists(targetPath)) {
       await fs.remove(targetPath);
     }
@@ -110,18 +118,11 @@ export async function addRepo(url: string, name?: string, branch?: string) {
   }
 }
 
-/**
- * Syncs (pulls) latest changes for one or all repositories.
- */
 export async function syncRepo(name?: string) {
   const config = await getConfig();
-  const reposToSync = name && name !== 'all' 
-    ? [name] 
-    : Object.keys(config.repos);
+  const reposToSync = name && name !== 'all' ? [name] : Object.keys(config.repos);
 
-  if (reposToSync.length === 0) {
-    return "No repositories found to sync.";
-  }
+  if (reposToSync.length === 0) return 'No repositories found to sync.';
 
   const results: string[] = [];
   for (const repoName of reposToSync) {
@@ -140,14 +141,12 @@ export async function syncRepo(name?: string) {
     try {
       const git = simpleGit(targetPath);
       const activeBranch = await getCurrentBranch(targetPath);
-
       if (activeBranch) {
         repo.branch = activeBranch;
         await git.pull('origin', activeBranch);
       } else {
         await git.pull();
       }
-
       repo.lastSync = new Date().toISOString();
       const branchSuffix = repo.branch ? ` on branch "${repo.branch}"` : '';
       results.push(`Successfully synced "${repoName}"${branchSuffix}`);
@@ -160,16 +159,10 @@ export async function syncRepo(name?: string) {
   return results.join('\n');
 }
 
-/**
- * Lists all managed repositories.
- */
 export async function listRepos() {
   const config = await getConfig();
   const repoList = Object.entries(config.repos);
-  
-  if (repoList.length === 0) {
-    return "No repositories added yet.";
-  }
+  if (repoList.length === 0) return 'No repositories added yet.';
 
   const output = repoList.map(([name, info]) => {
     const branchLabel = info.branch || 'unknown';
@@ -177,4 +170,175 @@ export async function listRepos() {
   }).join('\n');
 
   return `Managed Repositories:\n${output}`;
+}
+
+// ─── NEW: removeRepo ─────────────────────────────────────────
+
+export async function removeRepo(name: string, deleteFiles: boolean = true) {
+  const config = await getConfig();
+  if (!config.repos[name]) {
+    throw new Error(`Repository "${name}" is not tracked.`);
+  }
+
+  if (deleteFiles) {
+    const repoPath = path.resolve(process.cwd(), config.storagePath, name);
+    if (await fs.pathExists(repoPath)) {
+      await fs.remove(repoPath);
+    }
+  }
+
+  delete config.repos[name];
+  await saveConfig(config);
+  return `Repository "${name}" removed${deleteFiles ? ' (files deleted)' : ' (files kept)'}.`;
+}
+
+// ─── NEW: gitLog ─────────────────────────────────────────────
+
+export async function gitLog(
+  name: string,
+  options: {
+    limit?: number;
+    file?: string;
+    since?: string; // e.g. "2 weeks ago"
+  } = {},
+) {
+  const repoPath = await resolveRepoPath(name);
+  const git = simpleGit(repoPath);
+
+  const args: string[] = ['log', '--no-color', `--pretty=format:%h|%ad|%an|%s`, '--date=short'];
+  const limit = options.limit ?? 20;
+  args.push(`-n`, String(limit));
+  if (options.since) args.push(`--since=${options.since}`);
+  if (options.file) {
+    args.push('--');
+    args.push(options.file);
+  }
+
+  let raw: string;
+  try {
+    raw = await git.raw(args);
+  } catch (err: any) {
+    throw new Error(`git log failed: ${err.message}`);
+  }
+
+  const trimmed = raw.trim();
+  if (!trimmed) return `No commits found for "${name}"${options.file ? ` (file: ${options.file})` : ''}.`;
+
+  const lines = trimmed.split('\n').map((l) => {
+    const parts = l.split('|');
+    const sha = parts[0] ?? '';
+    const date = parts[1] ?? '';
+    const author = parts[2] ?? '';
+    const subject = parts.slice(3).join('|');
+    return `${sha}  ${date}  ${author.padEnd(20).slice(0, 20)}  ${subject}`;
+  });
+
+  let header = `Commits in "${name}"`;
+  if (options.file) header += ` (file: ${options.file})`;
+  if (options.since) header += ` (since: ${options.since})`;
+  header += ` — showing ${lines.length}:\n`;
+
+  return header + lines.join('\n');
+}
+
+// ─── NEW: gitShow ────────────────────────────────────────────
+
+const MAX_DIFF_BYTES = 64 * 1024;
+
+export async function gitShow(name: string, sha: string) {
+  if (!/^[a-f0-9]{4,40}$/i.test(sha)) {
+    throw new Error('Invalid commit SHA. Expected hex string of length 4-40.');
+  }
+  const repoPath = await resolveRepoPath(name);
+  const git = simpleGit(repoPath);
+
+  let raw: string;
+  try {
+    raw = await git.raw(['show', '--no-color', '--stat', '--patch', sha]);
+  } catch (err: any) {
+    throw new Error(`git show failed: ${err.message}`);
+  }
+
+  if (raw.length > MAX_DIFF_BYTES) {
+    return raw.slice(0, MAX_DIFF_BYTES) +
+      `\n\n[WARNING: Diff truncated at ${MAX_DIFF_BYTES} bytes — full size: ${raw.length} bytes]`;
+  }
+  return raw;
+}
+
+// ─── NEW: gitDiff ────────────────────────────────────────────
+
+export async function gitDiff(
+  name: string,
+  options: {
+    from?: string;
+    to?: string;
+    file?: string;
+    statOnly?: boolean;
+  } = {},
+) {
+  const repoPath = await resolveRepoPath(name);
+  const git = simpleGit(repoPath);
+
+  const args: string[] = ['diff', '--no-color'];
+  if (options.statOnly) args.push('--stat');
+  if (options.from && options.to) args.push(`${options.from}...${options.to}`);
+  else if (options.from) args.push(options.from);
+  if (options.file) {
+    args.push('--');
+    args.push(options.file);
+  }
+
+  let raw: string;
+  try {
+    raw = await git.raw(args);
+  } catch (err: any) {
+    throw new Error(`git diff failed: ${err.message}`);
+  }
+
+  if (!raw.trim()) return 'No differences.';
+  if (raw.length > MAX_DIFF_BYTES) {
+    return raw.slice(0, MAX_DIFF_BYTES) +
+      `\n\n[WARNING: Diff truncated at ${MAX_DIFF_BYTES} bytes — full size: ${raw.length} bytes. Use stat_only=true for summary.]`;
+  }
+  return raw;
+}
+
+// ─── NEW: listBranches ───────────────────────────────────────
+
+export async function listBranches(name: string, includeRemote: boolean = false) {
+  const repoPath = await resolveRepoPath(name);
+  const git = simpleGit(repoPath);
+
+  const branchInfo = includeRemote
+    ? await git.branch(['-a'])
+    : await git.branch();
+
+  const out: string[] = [];
+  out.push(`Current branch: ${branchInfo.current || '(detached)'}`);
+  out.push('');
+  out.push('Branches:');
+  for (const branch of branchInfo.all) {
+    const isCurrent = branch === branchInfo.current;
+    out.push(`  ${isCurrent ? '* ' : '  '}${branch}`);
+  }
+  return out.join('\n');
+}
+
+// ─── NEW: listTags ───────────────────────────────────────────
+
+export async function listTags(name: string, limit: number = 50) {
+  const repoPath = await resolveRepoPath(name);
+  const git = simpleGit(repoPath);
+
+  const tags = await git.tags();
+  if (tags.all.length === 0) return `No tags in "${name}".`;
+
+  // Sort tags reverse-alphabetically (newer semver tends to come last alphabetically, so reverse)
+  const sorted = [...tags.all].sort().reverse();
+  const sliced = sorted.slice(0, limit);
+  let out = `Tags in "${name}" (${tags.all.length} total):\n`;
+  out += sliced.join('\n');
+  if (sorted.length > limit) out += `\n... and ${sorted.length - limit} more`;
+  return out;
 }

@@ -1,17 +1,28 @@
 # Local MCP Server (Git & File Reader)
 
-A local Model Context Protocol (MCP) server that acts as a bridge between your AI Client (Claude Desktop, Cursor, etc.) and your local git repositories. This allows your AI to autonomously clone repos, sync changes, explore file structures, and read code locally.
+A local Model Context Protocol (MCP) server that acts as a bridge between your AI Client (Claude Desktop, Cursor, etc.) and your local git repositories. This allows your AI to autonomously clone repos, sync changes, explore code, and inspect git history locally — without burning API tokens on remote fetches.
 
-## Features
+## Features (v3.0 — 18 tools)
 
-- **Git Manager**:
-  - `add_repo`: Clone public GitHub repositories locally, including specific branches.
-  - `sync_repo`: Pull latest changes for tracked repositories.
-  - `list_repos`: View all managed repositories.
-- **File Reader**:
-  - `list_files`: Recursively list files (ignoring `.git`, `node_modules`, etc.).
-  - `read_file`: Read file content (smartly truncated at 50KB to save context).
-  - `search_code`: Simple case-insensitive grep/search across files.
+**Repo management**
+- `add_repo` / `sync_repo` / `list_repos` / `remove_repo`
+
+**Git inspection**
+- `git_log`: commit history with file/since filters
+- `git_show`: details/diff of a single commit
+- `git_diff`: diff between refs (branch, tag, commit), with `stat_only` for big diffs
+- `list_branches` (incl. remote) / `list_tags`
+
+**File & code**
+- `list_files`: recursive listing with ext + size + depth filters
+- `read_file`: full or line-range read; supports negative `start_line` (e.g. `-50` = last 50 lines)
+- `search_code`: text/regex search; **skips binary files**; supports `case_sensitive`, `regex`, `whole_word`, context lines, scope, ext filter
+- `get_tree`: visual directory tree
+- `find_docs`: smart README/docs discovery, ranked + previewed
+- `batch_read`: read many files in one call
+- `find_files`: glob by name (e.g. `**/*Config*.ts`)
+- `find_symbol`: locate **function/class/interface/type definitions** by name across TS/JS, Python, Go, Rust, Java/Kotlin/C#, PHP, Ruby
+- `search_all_repos`: search across every tracked repo at once
 
 ## Prerequisites
 
@@ -85,6 +96,14 @@ Once connected, you can ask your AI:
 > "Sync all my local repositories."
 
 > "Search for 'onMount' in the svelte repository and explain how it is used based on the code found."
+
+> "Where is `useAuth` defined in better-auth-docs?" (uses `find_symbol`)
+
+> "Show me the last 10 commits to `src/index.ts` in atlas." (uses `git_log` with `file`)
+
+> "Diff `v1.5.0` vs `v2.0.0` in drizzle-orm — stat only." (uses `git_diff` with `stat_only`)
+
+> "Find all files matching `**/test_*.py` under `src/`." (uses `find_files`)
 
 ## Project Structure
 
